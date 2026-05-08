@@ -1,0 +1,13 @@
+{
+  "name": "gemini-nano-cli",
+  "version": "1.0.0",
+  "description": "CLI tool to interact with Chrome's on-device Gemini Nano model via the Prompt API",
+  "type": "module",
+  "main": "chat.mjs",
+  "scripts": {
+    "start": "node chat.mjs"
+  },
+  "dependencies": {
+    "puppeteer": "^24.0.0"
+  }
+}

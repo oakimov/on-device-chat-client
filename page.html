@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <title>Gemini Nano CLI</title>
+</head>
+
+<body>
+  <script>
+    let session = null;
+
+    window.initModel = async function () {
+      const maxRetries = 5;
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          const api = window.ai?.languageModel || window.ai?.assistant || window.LanguageModel;
+
+          if (!api) {
+            return { error: 'Gemini Nano API not available. Make sure Chrome flags are enabled.' };
+          }
+
+          // Capabilities check without logging
+
+
+          try {
+            const options = {
+              expectedLanguage: 'en',
+              targetLanguage: 'en',
+              outputLanguage: 'en',
+              language: 'en',
+              systemLanguage: 'en',
+              expectedOutputs: [{ type: 'text', languages: ['en'] }]
+            };
+            if (typeof api.availability === 'function') {
+              await api.availability(options).catch(() => api.availability());
+            } else if (api.capabilities) {
+              await api.capabilities(options).catch(() => api.capabilities());
+            } else if (window.ai?.canCreateTextSession) {
+              await window.ai.canCreateTextSession();
+            }
+          } catch (e) {
+            // Check failed, ignore
+          }
+
+          // Call create once with all possible language keys to satisfy different Chrome versions
+          const tryCreate = async () => {
+            const options = {
+              expectedLanguage: 'en',
+              targetLanguage: 'en',
+              outputLanguage: 'en',
+              language: 'en',
+              systemLanguage: 'en',
+              expectedOutputs: [{ type: 'text', languages: ['en'] }]
+            };
+            try {
+              return await api.create(options);
+            } catch (e) {
+              console.log(`Create failed: ${e.message}`);
+              throw e;
+            }
+          };
+
+          session = await tryCreate();
+
+          return { ready: true };
+        } catch (e) {
+          if (i === maxRetries - 1) {
+            return { error: e.message };
+          }
+          console.log(`Model init attempt ${i + 1} failed, retrying...`);
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+    };
+
+    window.sendPrompt = async function (prompt) {
+      if (!session) {
+        return { error: 'Model not initialized' };
+      }
+      try {
+        const result = await session.prompt(prompt);
+        return { response: result };
+      } catch (e) {
+        console.error('Prompt error:', e.message);
+        return { error: e.message };
+      }
+    };
+
+    // For streaming, we collect chunks and report them via a callback mechanism.
+    window.sendPromptStreaming = async function (prompt) {
+      if (!session) {
+        return { error: 'Model not initialized' };
+      }
+      try {
+        const stream = session.promptStreaming(prompt);
+        let full = '';
+        for await (const chunk of stream) {
+          full += chunk;
+          // Expose the latest chunk for Puppeteer to poll
+          window.__lastChunk = chunk;
+          window.__fullResponse = full;
+          window.__chunkReady = Date.now();
+        }
+        return { response: full };
+      } catch (e) {
+        console.error('Streaming error:', e.message);
+        return { error: e.message };
+      }
+    };
+  </script>
+</body>
+
+</html>
