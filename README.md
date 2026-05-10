@@ -2,33 +2,11 @@
 
 ## Overview
 
-Chrome silently downloads a ~4GB Gemini Nano model to this directory for its on-device AI features. This repository contains a CLI tool to interact with the model, along with research findings on the model's format and Chrome's obfuscation mechanism.
-
-## Model Files
-
-| File | Size | Description |
-|------|------|-------------|
-| `weights.bin` | ~3.98 GB | The model weights (obfuscated) |
-| `manifest.json` | ~200 B | Component manifest (version, model spec) |
-| `on_device_model_execution_config.pb` | — | Execution configuration (protobuf) |
-| `_metadata/verified_contents.json` | — | Chrome component update metadata with SHA-256 treehashes |
-
-The manifest identifies this as:
-
-```json
-{
-  "name": "Optimization Guide On Device Model",
-  "version": "2025.8.8.1141",
-  "BaseModelSpec": {
-    "name": "v3Nano",
-    "version": "2025.06.30.1229"
-  }
-}
-```
+Chrome silently downloads a ~4GB Gemini Nano model to this directory for its on-device AI features. This repository contains a CLI tool to interact with the model, an OpenAI-compatible API server, and research findings on the model's format and Chrome's obfuscation mechanism.
 
 ## The CLI Tool
 
-A Node.js CLI that sends prompts to Chrome's built-in Gemini Nano model via the Prompt API. It auto-launches Chrome with the required flags, maintains a persistent `LanguageModel` session with conversation history across turns, and includes a live dashboard for monitoring context usage and performance.
+A Node.js CLI that sends prompts to Chrome's built-in Gemini Nano model via the Prompt API. It auto-launches Chrome with the required flags, maintains a persistent `LanguageModel` session with conversation history across turns, includes a live dashboard for monitoring context usage and performance, and exposes an OpenAI-compatible API for integration with other tools.
 
 ### Features
 
@@ -36,6 +14,8 @@ A Node.js CLI that sends prompts to Chrome's built-in Gemini Nano model via the 
 - **Persistent session** — conversation history carries across turns; use `/reset` to clear
 - **Markdown rendering** — model output (bold, code blocks, lists, links) is rendered with ANSI formatting in the terminal
 - **Live dashboard** — HTTP status page at `http://localhost:3457` showing context window usage, request count, timing (think/gen split), and token throughput
+- **OpenAI-compatible API** — `POST /v1/chat/completions` and `GET /v1/models` endpoints for integration with any OpenAI client
+- **Streaming & non-streaming** — both SSE streaming and full response modes
 - **Configurable sampling** — set `topK` and `temperature` via CLI flags or the `/config` command at runtime
 - **Whitespace stall detection** — detects when the model stalls on indentation-heavy output and aborts gracefully
 - **Progress indicator** — animated spinner while the model is thinking/generating
@@ -87,7 +67,7 @@ cat long_prompt.txt | node chat.mjs --temperature 0.5 --top-k 40
 | Flag | Description |
 |------|-------------|
 | `--prompt <text>` | Send a single prompt and exit |
-| `--port <n>` | HTTP port for dashboard (default: 3457) |
+| `--port <n>` | HTTP port for dashboard and API (default: 3457) |
 | `--cdp <n>` | Chrome DevTools Protocol port (default: 9222) |
 | `--top-k <n>` | Top-K sampling (default: model default) |
 | `--temperature <n>` | Temperature (default: model default) |
@@ -106,6 +86,86 @@ cat long_prompt.txt | node chat.mjs --temperature 0.5 --top-k 40
 | `/help` | Show available commands |
 | `exit` / `quit` | Same as `/exit` |
 
+### OpenAI-Compatible API
+
+The server exposes OpenAI-compatible endpoints alongside the dashboard. Any tool that speaks the OpenAI Chat Completions API can use it.
+
+**Base URL:** `http://localhost:3457`
+
+**Endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/v1/models` | List available models (includes context window stats) |
+| `GET` | `/v1/models/:id` | Get model details |
+| `POST` | `/v1/chat/completions` | Chat completion (streaming and non-streaming) |
+| `GET` | `/health` | Health check |
+
+**Example — curl (streaming):**
+
+```bash
+curl http://localhost:3457/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-nano",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Explain quantum computing briefly."}
+    ],
+    "stream": true
+  }'
+```
+
+**Example — curl (non-streaming):**
+
+```bash
+curl http://localhost:3457/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-nano",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false
+  }'
+```
+
+**Example — Python (OpenAI SDK):**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:3457/v1", api_key="unused")
+
+response = client.chat.completions.create(
+    model="gemini-nano",
+    messages=[{"role": "user", "content": "Hello!"}],
+    stream=True,
+)
+
+for chunk in response:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="")
+```
+
+**Example — Claude Code:**
+
+Set the API base in your configuration to point at the local server, and Claude Code can route requests to the on-device model.
+
+**Request format:**
+
+The API accepts standard OpenAI Chat Completions request bodies. Supported fields:
+
+- `messages` — array of `{role, content}` objects. System prompts are extracted and passed to the model's session. User and assistant messages are concatenated as the prompt.
+- `stream` — `true` for SSE streaming, `false` for full JSON response
+- `model` — any string (always uses Gemini Nano)
+- `temperature` — sampling temperature
+- `top_k` — top-K sampling parameter
+
+**Safeguards:**
+
+- **Auto-compact**: when context usage exceeds 85%, the session is reset with a compaction notice to prevent overflow
+- **Whitespace stall detection**: aborts generation after 2000+ consecutive whitespace characters
+- **Session persistence**: the model session persists across requests for conversation continuity; send a new system prompt to force a session reset
+
 ### Dashboard
 
 The tool serves a live dashboard at `http://localhost:3457` (configurable via `--port`). It shows:
@@ -120,19 +180,31 @@ The tool serves a live dashboard at `http://localhost:3457` (configurable via `-
 
 ### How It Works
 
-The tool auto-launches Chrome (or connects to a running instance), then loads a bridge page over HTTP from the built-in dashboard server. The bridge page accesses Chrome's `LanguageModel` API while the same URL serves as a monitoring dashboard for external browsers.
+The tool auto-launches Chrome (or connects to a running instance), then loads a bridge page over HTTP from the built-in server. The bridge page accesses Chrome's `LanguageModel` API while the same URL serves as a monitoring dashboard for external browsers. The server also translates OpenAI Chat Completions requests into Prompt API calls.
 
-1. **Persistent session** — `LanguageModel.create()` creates a session that lives across all turns, so conversation history accumulates naturally. The `contextoverflow` event warns when old messages are evicted. `topK` and `temperature` can be configured at creation time via CLI flags or the `/config` command.
+**Architecture:**
 
-2. **Evaluate-based inference** — `session.promptStreaming()` runs entirely inside the browser via `page.evaluate()`, avoiding fragile polling. The full `for-await` loop completes in-browser and returns `{response, truncated, elapsed, thinkMs, genMs}`.
+```
+┌──────────────────────────────┐     ┌──────────────────────────────┐
+│  CLI / API Clients           │     │  Chrome (Gemini Nano)        │
+│                              │     │                              │
+│  chat.mjs ──┬─ Interactive   │     │  page.html (bridge)          │
+│             ├─ Pipe mode      │     │   ├─ LanguageModel session   │
+│             └─ /v1/* API      │     │   ├─ Streaming + stall det.  │
+│                  │            │     │   └─ Dashboard UI            │
+│                  ▼            │     │           ▲                  │
+│  lib/server.mjs ── HTTP ◄────────────── CDP ──┘                  │
+│  lib/session.mjs ── Puppeteer page.evaluate()                    │
+└──────────────────────────────┘     └──────────────────────────────┘
+```
 
-3. **Markdown rendering** — model output is parsed with `marked` + `marked-terminal` and rendered with ANSI escape codes for bold, italic, code blocks (with syntax highlighting), lists, links, and tables.
+1. **Chrome lifecycle** (`chat.mjs`) — auto-launches Chrome with CDP flags or connects to a running instance via `puppeteer-core`.
 
-4. **Whitespace stall detection** — if the model produces 2000+ consecutive whitespace characters with no content, the stream is aborted to prevent hanging.
+2. **Session management** (`lib/session.mjs`) — wraps Puppeteer page communication. Ensures the bridge page is loaded, creates/destroys `LanguageModel` sessions, handles auto-compact at 85% context usage.
 
-5. **Dashboard** — the same HTTP server that serves the bridge page to Chrome also serves a monitoring dashboard for any browser on the network, showing context usage, think/gen timing split, and token throughput.
+3. **OpenAI-compatible server** (`lib/server.mjs`) — HTTP server with `POST /v1/chat/completions`, `GET /v1/models`, and SSE streaming. Extracts system prompts from messages, concatenates user/assistant turns, and translates responses to OpenAI format.
 
-This approach avoids needing to deobfuscate or convert the model at all — Chrome handles everything internally.
+4. **Bridge page** (`page.html`) — loaded in Chrome, accesses `window.LanguageModel`. Handles session creation with system prompts, streaming with stall detection, context overflow events, and a live dashboard UI.
 
 ---
 
@@ -229,10 +301,21 @@ The converter maps Gemini Nano's internal tensor names to HuggingFace Gemma nami
 
 ```
 .
-├── package.json                       # Node.js project
-├── chat.mjs                           # CLI entry point (auto-launch, dashboard server)
-├── page.html                          # Browser bridge (session, stall detection, dashboard UI)
+├── chat.mjs                       # CLI entry point (Chrome lifecycle, interactive mode)
+├── page.html                      # Browser bridge (session, streaming, dashboard UI)
+├── lib/
+│   ├── session.mjs                # SessionManager — Puppeteer page communication, auto-compact
+│   └── server.mjs                 # HTTP server — OpenAI-compatible API + dashboard hosting
+├── find_weights.js                # Utility to locate obfuscated model file
+├── package.json
 ├── README.md
-├── find_weights.js                    # Utility to locate obfuscated model file
-└── node_modules/                      # Dependencies
+└── node_modules/
 ```
+
+### Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `puppeteer-core` | Connect to Chrome via CDP (no bundled browser) |
+| `marked` | Parse Markdown from model output |
+| `marked-terminal` | Render Markdown with ANSI formatting in terminal |

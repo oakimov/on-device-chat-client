@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 
-import puppeteer from 'puppeteer';
+import puppeteer from 'puppeteer-core';
 import { existsSync, readFileSync } from 'fs';
 import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import readline from 'readline';
-import http from 'http';
 import { spawn } from 'child_process';
 import os from 'os';
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
+import { SessionManager } from './lib/session.mjs';
+import { createServer } from './lib/server.mjs';
 
 marked.use(markedTerminal({
   unescape: true,
@@ -452,42 +453,30 @@ async function cleanup(page, browser) {
   }
 }
 
-// ── HTTP server for dashboard ──
+// ── HTTP server (dashboard + OpenAI API) ──
 
-function startDashboardServer(port) {
+function startServer(port, sessionManager) {
   const htmlPath = resolve(__dirname, 'page.html');
-  let htmlContent;
+  let dashboardHtml;
   try {
-    htmlContent = readFileSync(htmlPath, 'utf-8');
+    dashboardHtml = readFileSync(htmlPath, 'utf-8');
   } catch (e) {
     process.stderr.write(`Warning: could not read page.html: ${e.message}\n`);
-    htmlContent = '<html><body><h1>Dashboard unavailable</h1></body></html>';
   }
 
-  const server = http.createServer((req, res) => {
-    if (req.url === '/' || req.url === '/index.html') {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(htmlContent);
-    } else if (req.url === '/favicon.ico') {
-      res.writeHead(204);
-      res.end();
-    } else {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found');
-    }
-  });
+  const server = createServer(sessionManager, { port, dashboardHtml });
 
   return new Promise((resolve) => {
     server.on('error', (err) => {
       if (err.code === 'EADDRINUSE') {
-        process.stderr.write(`Warning: port ${port} in use, dashboard not available\n`);
+        process.stderr.write(`Warning: port ${port} in use, server not available\n`);
         resolve(null);
       } else {
         throw err;
       }
     });
     server.listen(port, '127.0.0.1', () => {
-      process.stderr.write(`Dashboard: http://localhost:${port}\n`);
+      process.stderr.write(`Server: http://localhost:${port} (dashboard + OpenAI API)\n`);
       resolve(server);
     });
   });
@@ -514,8 +503,9 @@ async function main() {
     process.stderr.write(`[browser] PAGE ERROR: ${err.message}\n`);
   });
 
-  // Start dashboard HTTP server
-  const dashboardServer = await startDashboardServer(opts.port);
+  // Create session manager and start server (dashboard + OpenAI API)
+  const sessionManager = new SessionManager(page, { port: opts.port });
+  const httpServer = await startServer(opts.port, sessionManager);
 
   // Keep-alive to prevent CDP timeout
   const keepAlive = setInterval(async () => {
@@ -527,7 +517,7 @@ async function main() {
   const shutdown = async () => {
     clearInterval(keepAlive);
     await cleanup(page, browser);
-    if (dashboardServer) dashboardServer.close();
+    if (httpServer) httpServer.close();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
@@ -549,7 +539,7 @@ async function main() {
     process.stderr.write('  chrome://flags/#optimization-guide-on-device-model\n');
     process.stderr.write('  chrome://flags/#prompt-api-for-gemini-nano-multimodal-input\n');
     await cleanup(page, browser);
-    if (dashboardServer) dashboardServer.close();
+    if (httpServer) httpServer.close();
     process.exit(1);
   }
 
@@ -560,7 +550,7 @@ async function main() {
       process.stderr.write(`Error: ${e.message}\n`);
     }
     await cleanup(page, browser);
-    if (dashboardServer) dashboardServer.close();
+    if (httpServer) httpServer.close();
   } else if (!process.stdin.isTTY) {
     // Pipe mode: read stdin, send as prompt, write response to stdout
     let input = '';
@@ -580,7 +570,7 @@ async function main() {
       }
     }
     await cleanup(page, browser);
-    if (dashboardServer) dashboardServer.close();
+    if (httpServer) httpServer.close();
   } else {
     await interactiveMode(page, browser, opts, modelConfig);
   }

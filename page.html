@@ -50,16 +50,22 @@ function updateDashboard() {
 }
 
 let modelParams = null;
+let lastSystemPrompt = null;
 
 window.ensureSession = async function(configOverride) {
+  // Supports both { topK, temperature } and { systemPrompt, topK, temperature }
+  const systemPrompt = configOverride?.systemPrompt || null;
   if (conversationSession && !configOverride) {
     return { ready: true, contextUsage: conversationSession.contextUsage || 0, contextWindow: conversationSession.contextWindow || 0 };
   }
-  if (configOverride) {
-    if (conversationSession) {
-      try { conversationSession.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
-      conversationSession = null;
-    }
+  // Destroy if system prompt changed
+  if (systemPrompt && systemPrompt !== lastSystemPrompt && conversationSession) {
+    try { conversationSession.destroy(); } catch (e) {}
+    conversationSession = null;
+  }
+  if (configOverride && conversationSession) {
+    try { conversationSession.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
+    conversationSession = null;
   }
   const maxRetries = 5;
   for (let i = 0; i < maxRetries; i++) {
@@ -90,8 +96,12 @@ window.ensureSession = async function(configOverride) {
       var temp = (configOverride && configOverride.temperature != null) ? configOverride.temperature : (modelParams ? modelParams.defaultTemperature : undefined);
       if (topK != null) createOpts.topK = topK;
       if (temp != null) createOpts.temperature = temp;
+      if (systemPrompt) {
+        createOpts.initialPrompts = [{ role: 'system', content: systemPrompt }];
+        lastSystemPrompt = systemPrompt;
+      }
       if (configOverride) {
-        console.log('[bridge] Creating session: topK=' + topK + ', temperature=' + temp);
+        console.log('[bridge] Creating session: topK=' + topK + ', temperature=' + temp + (systemPrompt ? ', systemPrompt=' + systemPrompt.length + ' chars' : ''));
       }
       conversationSession = await api.create(createOpts);
       try {
@@ -116,6 +126,7 @@ window.resetSession = async function(configOverride) {
     conversationSession = null;
   }
   turnCount = 0;
+  lastSystemPrompt = null;
   return window.ensureSession(configOverride);
 };
 
