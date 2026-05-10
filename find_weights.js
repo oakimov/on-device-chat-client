@@ -3,10 +3,16 @@ import { resolve } from 'path';
 import os from 'os';
 
 function getDefaultProfilePath() {
+  const home = os.homedir();
   if (process.platform === 'darwin') {
-    return resolve(os.homedir(), 'Library/Application Support/Google/Chrome');
+    return resolve(home, 'Library/Application Support/Google/Chrome');
   }
-  return null;
+  if (process.platform === 'win32') {
+    return process.env.LOCALAPPDATA
+      ? resolve(process.env.LOCALAPPDATA, 'Google/Chrome/User Data')
+      : resolve(home, 'AppData/Local/Google/Chrome/User Data');
+  }
+  return resolve(home, '.config/google-chrome');
 }
 
 function findWeightsInProfile(profilePath) {

@@ -7,7 +7,15 @@
   "scripts": {
     "start": "node chat.mjs"
   },
+  "bin": {
+    "gemini-nano": "./chat.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
     "puppeteer": "^24.0.0"
   }
 }

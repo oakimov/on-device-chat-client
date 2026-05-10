@@ -1,113 +1,278 @@
 <!DOCTYPE html>
 <html>
-
 <head>
-  <title>Gemini Nano CLI</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gemini Nano Chat</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #e0e0e0; font: 14px/1.5 system-ui, sans-serif; padding: 24px; }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+  .sub { color: #888; font-size: 12px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+  .card { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 14px; }
+  .card .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
+  .card .value { font-size: 20px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .status-ok { color: #4caf50; }
+  .status-warn { color: #ff9800; }
+  #status { font-size: 13px; font-weight: 600; }
+  #log { margin-top: 20px; background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 12px; max-height: 300px; overflow-y: auto; font: 12px/1.6 monospace; white-space: pre-wrap; color: #aaa; }
+</style>
 </head>
-
 <body>
-  <script>
-    let session = null;
+<h1>Gemini Nano Chat</h1>
+<div class="sub">Chrome Prompt API — on-device model</div>
+<div class="grid">
+  <div class="card"><div class="label">Status</div><div id="status" class="value status-warn">Initializing...</div></div>
+  <div class="card"><div class="label">Context Window</div><div id="ctx" class="value">-</div></div>
+  <div class="card"><div class="label">Turns</div><div id="reqs" class="value">0</div></div>
+  <div class="card"><div class="label">Last Prompt</div><div id="prompt-len" class="value">-</div></div>
+  <div class="card"><div class="label">Last Response</div><div id="resp-len" class="value">-</div></div>
+  <div class="card"><div class="label">Think / Gen</div><div id="resp-time" class="value">-</div></div>
+  <div class="card"><div class="label">Tokens</div><div id="chars-sec" class="value">-</div></div>
+</div>
+<div id="log"></div>
+<script>
+let conversationSession = null;
+let turnCount = 0;
+let stats = { requests: 0, lastPromptLen: 0, lastRespLen: 0, lastTimeMs: 0, lastThinkMs: 0, lastGenMs: 0, lastTokens: 0, lastTokensPerSec: 0 };
 
-    window.initModel = async function () {
-      const maxRetries = 5;
-      for (let i = 0; i < maxRetries; i++) {
-        try {
-          const api = window.ai?.languageModel || window.ai?.assistant || window.LanguageModel;
+function updateDashboard() {
+  const ctx = conversationSession ? (conversationSession.contextUsage || 0) + ' / ' + (conversationSession.contextWindow || 0) + ' tokens' : 'no session';
+  document.getElementById('ctx').textContent = ctx;
+  document.getElementById('reqs').textContent = stats.requests;
+  document.getElementById('prompt-len').textContent = stats.lastPromptLen;
+  document.getElementById('resp-len').textContent = stats.lastRespLen;
+  document.getElementById('resp-time').textContent = stats.lastThinkMs ? 'think ' + (stats.lastThinkMs / 1000).toFixed(1) + 's / gen ' + (stats.lastGenMs / 1000).toFixed(1) + 's' : '-';
+  document.getElementById('chars-sec').textContent = stats.lastTokensPerSec ? stats.lastTokens + ' tok @ ' + stats.lastTokensPerSec + ' tok/s' : '-';
+  document.getElementById('status').textContent = conversationSession ? 'Session active (turn ' + turnCount + ')' : 'No session';
+  document.getElementById('status').style.color = conversationSession ? '#4caf50' : '#ff9800';
+}
 
-          if (!api) {
-            return { error: 'Gemini Nano API not available. Make sure Chrome flags are enabled.' };
-          }
+let modelParams = null;
 
-          // Capabilities check without logging
+window.ensureSession = async function(configOverride) {
+  if (conversationSession && !configOverride) {
+    return { ready: true, contextUsage: conversationSession.contextUsage || 0, contextWindow: conversationSession.contextWindow || 0 };
+  }
+  if (configOverride) {
+    if (conversationSession) {
+      try { conversationSession.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
+      conversationSession = null;
+    }
+  }
+  const maxRetries = 5;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const api = window.LanguageModel;
+      if (!api) {
+        if (i < maxRetries - 1) { await new Promise(r => setTimeout(r, 2000)); continue; }
+        return { step: 'check-api', error: 'window.LanguageModel not available after ' + maxRetries + ' retries' };
+      }
+      const availOpts = {
+        expectedInputs: [{ type: 'text', languages: ['en'] }],
+        expectedOutputs: [{ type: 'text', languages: ['en'] }]
+      };
+      try { if (typeof api.availability === 'function') await api.availability(availOpts); } catch (e) {}
+      let createOpts = {
+        expectedInputs: [{ type: 'text', languages: ['en'] }],
+        expectedOutputs: [{ type: 'text', languages: ['en'] }],
+      };
+      try {
+        if (typeof api.params === 'function') {
+          modelParams = await api.params(availOpts);
+          console.log('Default params: temperature=' + modelParams.defaultTemperature + ', topK=' + modelParams.defaultTopK + ', maxTemperature=' + modelParams.maxTemperature);
+        }
+      } catch (e) {
+        console.log('Could not query params, using defaults:', e.message);
+      }
+      var topK = (configOverride && configOverride.topK != null) ? configOverride.topK : (modelParams ? modelParams.defaultTopK : undefined);
+      var temp = (configOverride && configOverride.temperature != null) ? configOverride.temperature : (modelParams ? modelParams.defaultTemperature : undefined);
+      if (topK != null) createOpts.topK = topK;
+      if (temp != null) createOpts.temperature = temp;
+      if (configOverride) {
+        console.log('[bridge] Creating session: topK=' + topK + ', temperature=' + temp);
+      }
+      conversationSession = await api.create(createOpts);
+      try {
+        conversationSession.addEventListener('contextoverflow', function() {
+          console.log('[bridge] CONTEXT OVERFLOW — oldest messages being evicted');
+          updateDashboard();
+        });
+      } catch (e) {}
+      turnCount = 0;
+      updateDashboard();
+      return { ready: true, contextUsage: conversationSession.contextUsage || 0, contextWindow: conversationSession.contextWindow || 0 };
+    } catch (e) {
+      if (i === maxRetries - 1) return { step: 'create', error: e.message };
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+};
 
+window.resetSession = async function(configOverride) {
+  if (conversationSession) {
+    try { conversationSession.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
+    conversationSession = null;
+  }
+  turnCount = 0;
+  return window.ensureSession(configOverride);
+};
 
-          try {
-            const options = {
-              expectedLanguage: 'en',
-              targetLanguage: 'en',
-              outputLanguage: 'en',
-              language: 'en',
-              systemLanguage: 'en',
-              expectedOutputs: [{ type: 'text', languages: ['en'] }]
-            };
-            if (typeof api.availability === 'function') {
-              await api.availability(options).catch(() => api.availability());
-            } else if (api.capabilities) {
-              await api.capabilities(options).catch(() => api.capabilities());
-            } else if (window.ai?.canCreateTextSession) {
-              await window.ai.canCreateTextSession();
+window.getModelParams = function() {
+  return modelParams ? {
+    defaultTopK: modelParams.defaultTopK,
+    maxTopK: modelParams.maxTopK,
+    defaultTemperature: modelParams.defaultTemperature,
+    maxTemperature: modelParams.maxTemperature,
+  } : null;
+};
+
+window.getContextInfo = function() {
+  if (!conversationSession) return { usage: 0, window: 0 };
+  return { usage: conversationSession.contextUsage || 0, window: conversationSession.contextWindow || 0 };
+};
+
+window.updateStats = function(s) {
+  stats = s;
+  updateDashboard();
+};
+
+window.promptSession = async function(promptText) {
+  if (!conversationSession) return { error: 'Session not initialized' };
+  try {
+    const MAX_WS_STALL = 2000;
+    const controller = new AbortController();
+    const opts = { signal: controller.signal };
+    console.log('[bridge] Turn ' + (turnCount + 1) + ' prompt, length:', promptText.length);
+    const t0 = Date.now();
+    const stream = conversationSession.promptStreaming(promptText, opts);
+    let full = '';
+    let nonWsChars = 0;
+    let stallChars = 0;
+    let lastNonWsAt = 0;
+    let firstContentAt = 0;
+    let truncated = false;
+    try {
+      for await (const chunk of stream) {
+        full += chunk;
+        let chunkHasContent = false;
+        for (let i = 0; i < chunk.length; i++) {
+          if (chunk[i] === '\n') { /* skip */ }
+          else if (chunk[i] !== ' ' && chunk[i] !== '\t' && chunk[i] !== '\r') {
+            if (nonWsChars === 0) {
+              firstContentAt = Date.now();
+              const thinkMs = firstContentAt - t0;
+              console.log('[bridge] Thinking done in ' + (thinkMs / 1000).toFixed(1) + 's, generating...');
             }
-          } catch (e) {
-            // Check failed, ignore
+            nonWsChars++;
+            chunkHasContent = true;
           }
-
-          // Call create once with all possible language keys to satisfy different Chrome versions
-          const tryCreate = async () => {
-            const options = {
-              expectedLanguage: 'en',
-              targetLanguage: 'en',
-              outputLanguage: 'en',
-              language: 'en',
-              systemLanguage: 'en',
-              expectedOutputs: [{ type: 'text', languages: ['en'] }]
-            };
-            try {
-              return await api.create(options);
-            } catch (e) {
-              console.log(`Create failed: ${e.message}`);
-              throw e;
-            }
-          };
-
-          session = await tryCreate();
-
-          return { ready: true };
-        } catch (e) {
-          if (i === maxRetries - 1) {
-            return { error: e.message };
+        }
+        if (!chunkHasContent && nonWsChars > 0) {
+          stallChars += chunk.length;
+          if (lastNonWsAt === 0) lastNonWsAt = Date.now();
+          if (stallChars >= MAX_WS_STALL) {
+            console.log('[bridge] ' + MAX_WS_STALL + '+ whitespace chars with no content, aborting (stalled ' + ((Date.now() - lastNonWsAt) / 1000).toFixed(1) + 's)');
+            truncated = true;
+            controller.abort();
+            break;
           }
-          console.log(`Model init attempt ${i + 1} failed, retrying...`);
-          await new Promise(r => setTimeout(r, 2000));
+        } else if (chunkHasContent) {
+          stallChars = 0;
+          lastNonWsAt = 0;
+        }
+        if (stallChars > 500 && stallChars % 500 < chunk.length) {
+          console.log('[bridge] STALLING: ' + stallChars + ' whitespace chars, ' + ((Date.now() - lastNonWsAt) / 1000).toFixed(1) + 's since last content');
         }
       }
-    };
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        console.log('[bridge] Stream error (using partial output):', e.message);
+      }
+      truncated = true;
+    }
+    full = full.trimEnd();
+    const elapsed = Date.now() - t0;
+    const thinkMs = firstContentAt > 0 ? firstContentAt - t0 : elapsed;
+    const genMs = firstContentAt > 0 ? Date.now() - firstContentAt : 0;
+    turnCount++;
+    stats.requests++;
+    stats.lastPromptLen = promptText.length;
+    stats.lastRespLen = full.length;
+    stats.lastTimeMs = elapsed;
+    stats.lastThinkMs = thinkMs;
+    stats.lastGenMs = genMs;
+    stats.lastTokens = Math.round(full.length / 4);
+    stats.lastTokensPerSec = genMs > 0 ? Math.round(full.length / 4 * 1000 / genMs) : 0;
+    updateDashboard();
+    if (firstContentAt > 0) {
+      console.log('[bridge] Turn ' + turnCount + ' done in ' + elapsed + 'ms (think: ' + thinkMs + 'ms, gen: ' + genMs + 'ms), ' + full.length + ' chars' + (truncated ? ' [TRUNCATED]' : ''));
+    } else {
+      console.log('[bridge] Turn ' + turnCount + ' done in ' + elapsed + 'ms (no content), ' + full.length + ' chars' + (truncated ? ' [TRUNCATED]' : ''));
+    }
+    if (full.length === 0 && truncated) {
+      return { error: 'Output truncated before any content was produced' };
+    }
+    return { response: full, truncated: truncated, elapsed: elapsed, thinkMs: thinkMs, genMs: genMs };
+  } catch (e) {
+    console.log('[bridge] ERROR:', e.message);
+    return { error: e.message, stack: e.stack };
+  }
+};
 
-    window.sendPrompt = async function (prompt) {
-      if (!session) {
-        return { error: 'Model not initialized' };
-      }
-      try {
-        const result = await session.prompt(prompt);
-        return { response: result };
-      } catch (e) {
-        console.error('Prompt error:', e.message);
-        return { error: e.message };
-      }
-    };
+window.promptSessionNonStreaming = async function(promptText) {
+  if (!conversationSession) return { error: 'Session not initialized' };
+  try {
+    console.log('[bridge] Turn ' + (turnCount + 1) + ' prompt (non-streaming), length:', promptText.length);
+    const t0 = Date.now();
+    const response = await conversationSession.prompt(promptText);
+    const elapsed = Date.now() - t0;
+    const text = (response || '').trimEnd();
+    turnCount++;
+    stats.requests++;
+    stats.lastPromptLen = promptText.length;
+    stats.lastRespLen = text.length;
+    stats.lastTimeMs = elapsed;
+    stats.lastThinkMs = elapsed;
+    stats.lastGenMs = 0;
+    stats.lastTokens = Math.round(text.length / 4);
+    stats.lastTokensPerSec = 0;
+    updateDashboard();
+    console.log('[bridge] Turn ' + turnCount + ' done in ' + elapsed + 'ms, ' + text.length + ' chars');
+    return { response: text, truncated: false, elapsed: elapsed, thinkMs: elapsed, genMs: 0 };
+  } catch (e) {
+    console.log('[bridge] ERROR:', e.message);
+    return { error: e.message };
+  }
+};
 
-    // For streaming, we collect chunks and report them via a callback mechanism.
-    window.sendPromptStreaming = async function (prompt) {
-      if (!session) {
-        return { error: 'Model not initialized' };
-      }
-      try {
-        const stream = session.promptStreaming(prompt);
-        let full = '';
-        for await (const chunk of stream) {
-          full += chunk;
-          // Expose the latest chunk for Puppeteer to poll
-          window.__lastChunk = chunk;
-          window.__fullResponse = full;
-          window.__chunkReady = Date.now();
-        }
-        return { response: full };
-      } catch (e) {
-        console.error('Streaming error:', e.message);
-        return { error: e.message };
-      }
+window.addEventListener('beforeunload', function() {
+  if (conversationSession) {
+    try { conversationSession.destroy(); } catch (e) {}
+    conversationSession = null;
+  }
+});
+</script>
+<script>
+  (function() {
+    var logEl = document.getElementById('log');
+    var origLog = console.log;
+    console.log = function() {
+      var msg = Array.prototype.join.call(arguments, ' ');
+      var line = '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n';
+      logEl.textContent += line;
+      logEl.scrollTop = logEl.scrollHeight;
+      origLog.apply(console, arguments);
     };
-  </script>
+    var isBridge = typeof window.LanguageModel !== 'undefined';
+    console.log('[bridge] Bridge page loaded (bridge=' + isBridge + ')');
+    if (!isBridge) {
+      document.getElementById('status').textContent = 'Dashboard (monitoring only)';
+      document.getElementById('status').style.color = '#2196f3';
+    }
+    updateDashboard();
+  })();
+</script>
 </body>
-
 </html>

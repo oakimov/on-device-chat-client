@@ -28,17 +28,30 @@ The manifest identifies this as:
 
 ## The CLI Tool
 
-A Node.js CLI that sends prompts to Chrome's built-in Gemini Nano model via the Prompt API. It connects to a running Chrome instance using Puppeteer, creates a `LanguageModel` session, and streams responses to the terminal.
+A Node.js CLI that sends prompts to Chrome's built-in Gemini Nano model via the Prompt API. It auto-launches Chrome with the required flags, maintains a persistent `LanguageModel` session with conversation history across turns, and includes a live dashboard for monitoring context usage and performance.
+
+### Features
+
+- **Auto-launch Chrome** — starts Chrome with the required flags if not already running
+- **Persistent session** — conversation history carries across turns; use `/reset` to clear
+- **Markdown rendering** — model output (bold, code blocks, lists, links) is rendered with ANSI formatting in the terminal
+- **Live dashboard** — HTTP status page at `http://localhost:3457` showing context window usage, request count, timing (think/gen split), and token throughput
+- **Configurable sampling** — set `topK` and `temperature` via CLI flags or the `/config` command at runtime
+- **Whitespace stall detection** — detects when the model stalls on indentation-heavy output and aborts gracefully
+- **Progress indicator** — animated spinner while the model is thinking/generating
+- **Timing stats** — reports prompt processing time, generation time, token count (~chars/4), and tokens/sec after each response
+- **Pipe mode** — when stdin is not a TTY, reads from pipe and writes to stdout (e.g. `echo "hello" | node chat.mjs`)
+- **Graceful shutdown** — calls `session.destroy()` on exit to release Chrome model memory
 
 ### Prerequisites
 
-- macOS with Google Chrome installed at `/Applications/Google Chrome.app`
+- macOS, Windows, or Linux with Google Chrome (or Chromium) installed
 - Node.js 18+
 - Enable these Chrome flags by visiting them in Chrome's address bar:
   - `chrome://flags/#optimization-guide-on-device-model` → **Enabled**
   - `chrome://flags/#prompt-api-for-gemini-nano-multimodal-input` → **Enabled**
 - Restart Chrome after enabling flags and wait for the model to download (~4GB)
-- You must launch Chrome from the terminal with remote debugging enabled (see instructions below).
+- On Windows, use **Windows Terminal** or **PowerShell** — the progress spinner and ANSI formatting don't render correctly in `cmd.exe`
 
 ### Installation
 
@@ -46,21 +59,15 @@ A Node.js CLI that sends prompts to Chrome's built-in Gemini Nano model via the 
 npm install
 ```
 
-### Starting Chrome
-
-Before using the CLI, you must completely close all instances of Chrome and start it from your terminal with the remote debugging port and a dedicated user data directory enabled:
-
-**macOS:**
-```bash
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug-profile
-```
-
-**Windows:**
-```cmd
-"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir=%TEMP%\chrome-debug-profile
-```
-
 ### Usage
+
+**Interactive mode (auto-launches Chrome):**
+
+```bash
+node chat.mjs
+# Type prompts and press Enter. Conversation history persists across turns.
+# Commands: /status, /reset, /config, /exit, /quit, /help
+```
 
 **Single prompt:**
 
@@ -68,35 +75,62 @@ Before using the CLI, you must completely close all instances of Chrome and star
 node chat.mjs --prompt "Explain quantum computing in one paragraph"
 ```
 
-**Interactive mode:**
+**Pipe mode (non-interactive):**
 
 ```bash
-node chat.mjs
-# Type prompts and press Enter. Type "exit" to quit.
+echo "What is the capital of France?" | node chat.mjs
+cat long_prompt.txt | node chat.mjs --temperature 0.5 --top-k 40
 ```
-
-
 
 **Options:**
 
 | Flag | Description |
 |------|-------------|
 | `--prompt <text>` | Send a single prompt and exit |
-| `--model-path <p>` | Path to weights.bin (bypasses profile requirements) |
+| `--port <n>` | HTTP port for dashboard (default: 3457) |
+| `--cdp <n>` | Chrome DevTools Protocol port (default: 9222) |
+| `--top-k <n>` | Top-K sampling (default: model default) |
+| `--temperature <n>` | Temperature (default: model default) |
 | `--no-stream` | Wait for full response instead of streaming |
+| `--no-launch` | Don't auto-launch Chrome (require it running) |
 | `-h`, `--help` | Show help |
+
+**Interactive commands:**
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Show session stats (turns, context, think/gen timing, tok/s) |
+| `/reset` | Reset session and clear conversation history |
+| `/config` | View or set model parameters (`topK`, `temperature`) |
+| `/exit`, `/quit` | Exit gracefully (destroy session, disconnect) |
+| `/help` | Show available commands |
+| `exit` / `quit` | Same as `/exit` |
+
+### Dashboard
+
+The tool serves a live dashboard at `http://localhost:3457` (configurable via `--port`). It shows:
+
+- **Status** — session state and turn count
+- **Context Window** — current token usage / total window
+- **Turns** — number of requests processed
+- **Last Prompt/Response** — character counts
+- **Think / Gen** — prompt processing time / generation time
+- **Tokens** — estimated token count and tokens/sec
+- **Log** — browser-side events (session init, thinking time, errors)
 
 ### How It Works
 
-The tool uses Puppeteer to connect to your running Chrome instance on port 9222, then loads a minimal HTML page that calls Chrome's `LanguageModel` JavaScript API:
+The tool auto-launches Chrome (or connects to a running instance), then loads a bridge page over HTTP from the built-in dashboard server. The bridge page accesses Chrome's `LanguageModel` API while the same URL serves as a monitoring dashboard for external browsers.
 
-```js
-const session = await LanguageModel.create();
-const stream = session.promptStreaming("Hello!");
-for await (const chunk of stream) {
-  process.stdout.write(chunk);
-}
-```
+1. **Persistent session** — `LanguageModel.create()` creates a session that lives across all turns, so conversation history accumulates naturally. The `contextoverflow` event warns when old messages are evicted. `topK` and `temperature` can be configured at creation time via CLI flags or the `/config` command.
+
+2. **Evaluate-based inference** — `session.promptStreaming()` runs entirely inside the browser via `page.evaluate()`, avoiding fragile polling. The full `for-await` loop completes in-browser and returns `{response, truncated, elapsed, thinkMs, genMs}`.
+
+3. **Markdown rendering** — model output is parsed with `marked` + `marked-terminal` and rendered with ANSI escape codes for bold, italic, code blocks (with syntax highlighting), lists, links, and tables.
+
+4. **Whitespace stall detection** — if the model produces 2000+ consecutive whitespace characters with no content, the stream is aborted to prevent hanging.
+
+5. **Dashboard** — the same HTTP server that serves the bridge page to Chrome also serves a monitoring dashboard for any browser on the network, showing context usage, think/gen timing split, and token throughput.
 
 This approach avoids needing to deobfuscate or convert the model at all — Chrome handles everything internally.
 
@@ -196,7 +230,9 @@ The converter maps Gemini Nano's internal tensor names to HuggingFace Gemma nami
 ```
 .
 ├── package.json                       # Node.js project
-├── chat.mjs                           # CLI entry point
-├── page.html                          # Prompt API bridge page
+├── chat.mjs                           # CLI entry point (auto-launch, dashboard server)
+├── page.html                          # Browser bridge (session, stall detection, dashboard UI)
+├── README.md
+├── find_weights.js                    # Utility to locate obfuscated model file
 └── node_modules/                      # Dependencies
 ```
