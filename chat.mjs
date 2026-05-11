@@ -491,14 +491,6 @@ async function main() {
   const pages = await browser.pages();
   const page = pages[0] || await browser.newPage();
 
-  // Browser console forwarding — bridge page uses [bridge] prefix for important logs
-  page.on("console", (msg) => {
-    const text = msg.text();
-    if (text.startsWith("[bridge]")) {
-      process.stderr.write(`[browser] ${text.slice(8)}\n`);
-    }
-  });
-
   page.on("pageerror", (err) => {
     process.stderr.write(`[browser] PAGE ERROR: ${err.message}\n`);
   });
@@ -551,6 +543,7 @@ async function main() {
     }
     await cleanup(page, browser);
     if (httpServer) httpServer.close();
+    process.exit(0);
   } else if (!process.stdin.isTTY) {
     // Pipe mode: read stdin, send as prompt, write response to stdout
     let input = '';
@@ -571,6 +564,7 @@ async function main() {
     }
     await cleanup(page, browser);
     if (httpServer) httpServer.close();
+    process.exit(0);
   } else {
     await interactiveMode(page, browser, opts, modelConfig);
   }
