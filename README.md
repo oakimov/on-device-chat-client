@@ -188,9 +188,11 @@ The API accepts standard OpenAI Chat Completions request bodies. Supported field
 
 **Safeguards:**
 
+- **Per-client session isolation**: each API client gets a unique session fingerprinted by IP + User-Agent; the CLI has its own isolated session
 - **Auto-compact**: when context usage exceeds 85%, the session is reset with a compaction notice to prevent overflow
 - **Whitespace stall detection**: aborts generation after 2000+ consecutive whitespace characters
-- **Session persistence**: the model session persists across requests for conversation continuity; send a new system prompt to force a session reset
+- **Session persistence**: model sessions persist across requests for conversation continuity within the same client; send a new system prompt to force a session reset
+- **Request validation**: messages array validated with OpenAI-style error responses; 1MB body size limit; 120s request timeout
 
 ### Dashboard
 
@@ -215,10 +217,10 @@ The tool auto-launches Chrome (or connects to a running instance), then loads a 
 │  CLI / API Clients           │     │  Chrome (Gemini Nano)        │
 │                              │     │                              │
 │  chat.mjs ──┬─ Interactive   │     │  page.html (bridge)          │
-│             ├─ Pipe mode     │     │   ├─ LanguageModel session   │
-│             └─ /v1/* API     │     │   ├─ Streaming + stall det.  │
-│                  │           │     │   └─ Dashboard UI            │
-│                  ▼           │     │           ▲                  │
+│             ├─ Pipe mode     │     │   ├─ Multi-session map       │
+│             └─ /v1/* API     │     │   │  (sessionId → session)   │
+│                  │           │     │   ├─ Streaming + stall det.  │
+│                  ▼           │     │   └─ Dashboard UI (CLI)      │
 │  lib/server.mjs ── HTTP ◄────────────── CDP ──┘                   │
 │  lib/session.mjs ── Puppeteer page.evaluate()                     │
 └──────────────────────────────┘     └──────────────────────────────┘
@@ -226,11 +228,11 @@ The tool auto-launches Chrome (or connects to a running instance), then loads a 
 
 1. **Chrome lifecycle** (`chat.mjs`) — auto-launches Chrome with CDP flags or connects to a running instance via `puppeteer-core`.
 
-2. **Session management** (`lib/session.mjs`) — wraps Puppeteer page communication. Ensures the bridge page is loaded, creates/destroys `LanguageModel` sessions, handles auto-compact at 85% context usage.
+2. **Session management** (`lib/session.mjs`) — wraps Puppeteer page communication. Manages per-client sessions with independent mutexes. Ensures the bridge page is loaded, creates/destroys `LanguageModel` sessions, handles auto-compact at 85% context usage.
 
-3. **OpenAI-compatible server** (`lib/server.mjs`) — HTTP server with `POST /v1/chat/completions`, `GET /v1/models`, and SSE streaming. Extracts system prompts from messages, concatenates user/assistant turns, and translates responses to OpenAI format.
+3. **OpenAI-compatible server** (`lib/server.mjs`) — HTTP server with `POST /v1/chat/completions`, `GET /v1/models`, and SSE streaming. Fingerprints clients by IP + User-Agent for session isolation. Extracts system prompts from messages, concatenates user/assistant turns, and translates responses to OpenAI format.
 
-4. **Bridge page** (`page.html`) — loaded in Chrome, accesses `window.LanguageModel`. Handles session creation with system prompts, streaming with stall detection, context overflow events, and a live dashboard UI.
+4. **Bridge page** (`page.html`) — loaded in Chrome, accesses `window.LanguageModel`. Maintains a map of independent sessions keyed by session ID. Handles session creation with system prompts, streaming with stall detection, context overflow events, and a live dashboard UI for the CLI session.
 
 ---
 

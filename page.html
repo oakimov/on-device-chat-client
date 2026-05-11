@@ -33,39 +33,67 @@
 </div>
 <div id="log"></div>
 <script>
-let conversationSession = null;
-let turnCount = 0;
-let stats = { requests: 0, lastPromptLen: 0, lastRespLen: 0, lastTimeMs: 0, lastThinkMs: 0, lastGenMs: 0, lastTokens: 0, lastTokensPerSec: 0 };
+// Multi-session support: sessionId -> { session, lastSystemPrompt, turnCount, stats }
+let sessions = {};
+let modelParams = null;
+
+function getEntry(sessionId) {
+  return sessions[sessionId || 'cli'] || null;
+}
+
+function getOrCreateEntry(sessionId) {
+  const id = sessionId || 'cli';
+  if (!sessions[id]) {
+    sessions[id] = {
+      session: null,
+      lastSystemPrompt: null,
+      turnCount: 0,
+      stats: { requests: 0, lastPromptLen: 0, lastRespLen: 0, lastTimeMs: 0, lastThinkMs: 0, lastGenMs: 0, lastTokens: 0, lastTokensPerSec: 0 },
+    };
+  }
+  return sessions[id];
+}
 
 function updateDashboard() {
-  const ctx = conversationSession ? (conversationSession.contextUsage || 0) + ' / ' + (conversationSession.contextWindow || 0) + ' tokens' : 'no session';
+  const cli = sessions['cli'];
+  const session = cli?.session || null;
+  const stats = cli?.stats || { requests: 0, lastPromptLen: 0, lastRespLen: 0, lastThinkMs: 0, lastGenMs: 0, lastTokens: 0, lastTokensPerSec: 0 };
+  const turnCount = cli?.turnCount || 0;
+  const ctx = session ? (session.contextUsage || 0) + ' / ' + (session.contextWindow || 0) + ' tokens' : 'no session';
   document.getElementById('ctx').textContent = ctx;
   document.getElementById('reqs').textContent = stats.requests;
   document.getElementById('prompt-len').textContent = stats.lastPromptLen;
   document.getElementById('resp-len').textContent = stats.lastRespLen;
   document.getElementById('resp-time').textContent = stats.lastThinkMs ? 'think ' + (stats.lastThinkMs / 1000).toFixed(1) + 's / gen ' + (stats.lastGenMs / 1000).toFixed(1) + 's' : '-';
   document.getElementById('chars-sec').textContent = stats.lastTokensPerSec ? stats.lastTokens + ' tok @ ' + stats.lastTokensPerSec + ' tok/s' : '-';
-  document.getElementById('status').textContent = conversationSession ? 'Session active (turn ' + turnCount + ')' : 'No session';
-  document.getElementById('status').style.color = conversationSession ? '#4caf50' : '#ff9800';
+  document.getElementById('status').textContent = session ? 'Session active (turn ' + turnCount + ')' : 'No session';
+  document.getElementById('status').style.color = session ? '#4caf50' : '#ff9800';
 }
 
-let modelParams = null;
-let lastSystemPrompt = null;
-
-window.ensureSession = async function(configOverride) {
-  // Supports both { topK, temperature } and { systemPrompt, topK, temperature }
+window.ensureSession = async function(sessionIdOrConfig, maybeConfig) {
+  // Backward compat: if first arg is not a string, treat as configOverride with sessionId='cli'
+  let sessionId, configOverride;
+  if (typeof sessionIdOrConfig === 'string') {
+    sessionId = sessionIdOrConfig;
+    configOverride = maybeConfig;
+  } else {
+    sessionId = 'cli';
+    configOverride = sessionIdOrConfig;
+  }
+  const entry = getOrCreateEntry(sessionId);
   const systemPrompt = configOverride?.systemPrompt || null;
-  if (conversationSession && !configOverride) {
-    return { ready: true, contextUsage: conversationSession.contextUsage || 0, contextWindow: conversationSession.contextWindow || 0 };
+
+  if (entry.session && !configOverride) {
+    return { ready: true, contextUsage: entry.session.contextUsage || 0, contextWindow: entry.session.contextWindow || 0 };
   }
   // Destroy if system prompt changed
-  if (systemPrompt && systemPrompt !== lastSystemPrompt && conversationSession) {
-    try { conversationSession.destroy(); } catch (e) {}
-    conversationSession = null;
+  if (systemPrompt && systemPrompt !== entry.lastSystemPrompt && entry.session) {
+    try { entry.session.destroy(); } catch (e) {}
+    entry.session = null;
   }
-  if (configOverride && conversationSession) {
-    try { conversationSession.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
-    conversationSession = null;
+  if (configOverride && entry.session) {
+    try { entry.session.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
+    entry.session = null;
   }
   const maxRetries = 5;
   for (let i = 0; i < maxRetries; i++) {
@@ -98,21 +126,21 @@ window.ensureSession = async function(configOverride) {
       if (temp != null) createOpts.temperature = temp;
       if (systemPrompt) {
         createOpts.initialPrompts = [{ role: 'system', content: systemPrompt }];
-        lastSystemPrompt = systemPrompt;
+        entry.lastSystemPrompt = systemPrompt;
       }
       if (configOverride) {
-        console.log('[bridge] Creating session: topK=' + topK + ', temperature=' + temp + (systemPrompt ? ', systemPrompt=' + systemPrompt.length + ' chars' : ''));
+        console.log('[bridge] Creating session ' + sessionId + ': topK=' + topK + ', temperature=' + temp + (systemPrompt ? ', systemPrompt=' + systemPrompt.length + ' chars' : ''));
       }
-      conversationSession = await api.create(createOpts);
+      entry.session = await api.create(createOpts);
       try {
-        conversationSession.addEventListener('contextoverflow', function() {
-          console.log('[bridge] CONTEXT OVERFLOW — oldest messages being evicted');
-          updateDashboard();
+        entry.session.addEventListener('contextoverflow', function() {
+          console.log('[bridge] CONTEXT OVERFLOW in session ' + sessionId + ' — oldest messages being evicted');
+          if (sessionId === 'cli') updateDashboard();
         });
       } catch (e) {}
-      turnCount = 0;
-      updateDashboard();
-      return { ready: true, contextUsage: conversationSession.contextUsage || 0, contextWindow: conversationSession.contextWindow || 0 };
+      entry.turnCount = 0;
+      if (sessionId === 'cli') updateDashboard();
+      return { ready: true, contextUsage: entry.session.contextUsage || 0, contextWindow: entry.session.contextWindow || 0 };
     } catch (e) {
       if (i === maxRetries - 1) return { step: 'create', error: e.message };
       await new Promise(r => setTimeout(r, 2000));
@@ -120,14 +148,23 @@ window.ensureSession = async function(configOverride) {
   }
 };
 
-window.resetSession = async function(configOverride) {
-  if (conversationSession) {
-    try { conversationSession.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
-    conversationSession = null;
+window.resetSession = async function(sessionIdOrConfig, maybeConfig) {
+  let sessionId, configOverride;
+  if (typeof sessionIdOrConfig === 'string') {
+    sessionId = sessionIdOrConfig;
+    configOverride = maybeConfig;
+  } else {
+    sessionId = 'cli';
+    configOverride = sessionIdOrConfig;
   }
-  turnCount = 0;
-  lastSystemPrompt = null;
-  return window.ensureSession(configOverride);
+  const entry = getOrCreateEntry(sessionId);
+  if (entry.session) {
+    try { entry.session.destroy(); } catch (e) { console.log('[bridge] destroy failed:', e.message); }
+    entry.session = null;
+  }
+  entry.turnCount = 0;
+  entry.lastSystemPrompt = null;
+  return window.ensureSession(sessionId, configOverride);
 };
 
 window.getModelParams = function() {
@@ -139,25 +176,45 @@ window.getModelParams = function() {
   } : null;
 };
 
-window.getContextInfo = function() {
-  if (!conversationSession) return { usage: 0, window: 0 };
-  return { usage: conversationSession.contextUsage || 0, window: conversationSession.contextWindow || 0 };
+window.getContextInfo = function(sessionId) {
+  const entry = getEntry(sessionId || 'cli');
+  if (!entry || !entry.session) return { usage: 0, window: 0 };
+  return { usage: entry.session.contextUsage || 0, window: entry.session.contextWindow || 0 };
 };
 
 window.updateStats = function(s) {
-  stats = s;
+  const cli = getOrCreateEntry('cli');
+  cli.stats = s;
   updateDashboard();
 };
 
-window.promptSession = async function(promptText) {
-  if (!conversationSession) return { error: 'Session not initialized' };
+window.destroySession = function(sessionId) {
+  const id = sessionId || 'cli';
+  const entry = sessions[id];
+  if (entry && entry.session) {
+    try { entry.session.destroy(); } catch (e) {}
+    delete sessions[id];
+  }
+};
+
+window.promptSession = async function(sessionIdOrText, maybeText) {
+  let sessionId, promptText;
+  if (typeof sessionIdOrText === 'string' && maybeText !== undefined) {
+    sessionId = sessionIdOrText;
+    promptText = maybeText;
+  } else {
+    sessionId = 'cli';
+    promptText = sessionIdOrText;
+  }
+  const entry = getEntry(sessionId);
+  if (!entry || !entry.session) return { error: 'Session not initialized' };
   try {
     const MAX_WS_STALL = 2000;
     const controller = new AbortController();
     const opts = { signal: controller.signal };
-    console.log('[bridge] Turn ' + (turnCount + 1) + ' prompt, length:', promptText.length);
+    console.log('[bridge] Session ' + sessionId + ' turn ' + (entry.turnCount + 1) + ' prompt, length:', promptText.length);
     const t0 = Date.now();
-    const stream = conversationSession.promptStreaming(promptText, opts);
+    const stream = entry.session.promptStreaming(promptText, opts);
     let full = '';
     let nonWsChars = 0;
     let stallChars = 0;
@@ -174,7 +231,7 @@ window.promptSession = async function(promptText) {
             if (nonWsChars === 0) {
               firstContentAt = Date.now();
               const thinkMs = firstContentAt - t0;
-              console.log('[bridge] Thinking done in ' + (thinkMs / 1000).toFixed(1) + 's, generating...');
+              console.log('[bridge] Session ' + sessionId + ' thinking done in ' + (thinkMs / 1000).toFixed(1) + 's, generating...');
             }
             nonWsChars++;
             chunkHasContent = true;
@@ -184,7 +241,7 @@ window.promptSession = async function(promptText) {
           stallChars += chunk.length;
           if (lastNonWsAt === 0) lastNonWsAt = Date.now();
           if (stallChars >= MAX_WS_STALL) {
-            console.log('[bridge] ' + MAX_WS_STALL + '+ whitespace chars with no content, aborting (stalled ' + ((Date.now() - lastNonWsAt) / 1000).toFixed(1) + 's)');
+            console.log('[bridge] Session ' + sessionId + ': ' + MAX_WS_STALL + '+ whitespace chars with no content, aborting (stalled ' + ((Date.now() - lastNonWsAt) / 1000).toFixed(1) + 's)');
             truncated = true;
             controller.abort();
             break;
@@ -194,12 +251,12 @@ window.promptSession = async function(promptText) {
           lastNonWsAt = 0;
         }
         if (stallChars > 500 && stallChars % 500 < chunk.length) {
-          console.log('[bridge] STALLING: ' + stallChars + ' whitespace chars, ' + ((Date.now() - lastNonWsAt) / 1000).toFixed(1) + 's since last content');
+          console.log('[bridge] Session ' + sessionId + ' STALLING: ' + stallChars + ' whitespace chars, ' + ((Date.now() - lastNonWsAt) / 1000).toFixed(1) + 's since last content');
         }
       }
     } catch (e) {
       if (e.name !== 'AbortError') {
-        console.log('[bridge] Stream error (using partial output):', e.message);
+        console.log('[bridge] Session ' + sessionId + ' stream error (using partial output):', e.message);
       }
       truncated = true;
     }
@@ -207,62 +264,73 @@ window.promptSession = async function(promptText) {
     const elapsed = Date.now() - t0;
     const thinkMs = firstContentAt > 0 ? firstContentAt - t0 : elapsed;
     const genMs = firstContentAt > 0 ? Date.now() - firstContentAt : 0;
-    turnCount++;
-    stats.requests++;
-    stats.lastPromptLen = promptText.length;
-    stats.lastRespLen = full.length;
-    stats.lastTimeMs = elapsed;
-    stats.lastThinkMs = thinkMs;
-    stats.lastGenMs = genMs;
-    stats.lastTokens = Math.round(full.length / 4);
-    stats.lastTokensPerSec = genMs > 0 ? Math.round(full.length / 4 * 1000 / genMs) : 0;
-    updateDashboard();
+    entry.turnCount++;
+    entry.stats.requests++;
+    entry.stats.lastPromptLen = promptText.length;
+    entry.stats.lastRespLen = full.length;
+    entry.stats.lastTimeMs = elapsed;
+    entry.stats.lastThinkMs = thinkMs;
+    entry.stats.lastGenMs = genMs;
+    entry.stats.lastTokens = Math.round(full.length / 4);
+    entry.stats.lastTokensPerSec = genMs > 0 ? Math.round(full.length / 4 * 1000 / genMs) : 0;
+    if (sessionId === 'cli') updateDashboard();
     if (firstContentAt > 0) {
-      console.log('[bridge] Turn ' + turnCount + ' done in ' + elapsed + 'ms (think: ' + thinkMs + 'ms, gen: ' + genMs + 'ms), ' + full.length + ' chars' + (truncated ? ' [TRUNCATED]' : ''));
+      console.log('[bridge] Session ' + sessionId + ' turn ' + entry.turnCount + ' done in ' + elapsed + 'ms (think: ' + thinkMs + 'ms, gen: ' + genMs + 'ms), ' + full.length + ' chars' + (truncated ? ' [TRUNCATED]' : ''));
     } else {
-      console.log('[bridge] Turn ' + turnCount + ' done in ' + elapsed + 'ms (no content), ' + full.length + ' chars' + (truncated ? ' [TRUNCATED]' : ''));
+      console.log('[bridge] Session ' + sessionId + ' turn ' + entry.turnCount + ' done in ' + elapsed + 'ms (no content), ' + full.length + ' chars' + (truncated ? ' [TRUNCATED]' : ''));
     }
     if (full.length === 0 && truncated) {
       return { error: 'Output truncated before any content was produced' };
     }
     return { response: full, truncated: truncated, elapsed: elapsed, thinkMs: thinkMs, genMs: genMs };
   } catch (e) {
-    console.log('[bridge] ERROR:', e.message);
+    console.log('[bridge] Session ' + sessionId + ' ERROR:', e.message);
     return { error: e.message, stack: e.stack };
   }
 };
 
-window.promptSessionNonStreaming = async function(promptText) {
-  if (!conversationSession) return { error: 'Session not initialized' };
+window.promptSessionNonStreaming = async function(sessionIdOrText, maybeText) {
+  let sessionId, promptText;
+  if (typeof sessionIdOrText === 'string' && maybeText !== undefined) {
+    sessionId = sessionIdOrText;
+    promptText = maybeText;
+  } else {
+    sessionId = 'cli';
+    promptText = sessionIdOrText;
+  }
+  const entry = getEntry(sessionId);
+  if (!entry || !entry.session) return { error: 'Session not initialized' };
   try {
-    console.log('[bridge] Turn ' + (turnCount + 1) + ' prompt (non-streaming), length:', promptText.length);
+    console.log('[bridge] Session ' + sessionId + ' turn ' + (entry.turnCount + 1) + ' prompt (non-streaming), length:', promptText.length);
     const t0 = Date.now();
-    const response = await conversationSession.prompt(promptText);
+    const response = await entry.session.prompt(promptText);
     const elapsed = Date.now() - t0;
     const text = (response || '').trimEnd();
-    turnCount++;
-    stats.requests++;
-    stats.lastPromptLen = promptText.length;
-    stats.lastRespLen = text.length;
-    stats.lastTimeMs = elapsed;
-    stats.lastThinkMs = elapsed;
-    stats.lastGenMs = 0;
-    stats.lastTokens = Math.round(text.length / 4);
-    stats.lastTokensPerSec = 0;
-    updateDashboard();
-    console.log('[bridge] Turn ' + turnCount + ' done in ' + elapsed + 'ms, ' + text.length + ' chars');
+    entry.turnCount++;
+    entry.stats.requests++;
+    entry.stats.lastPromptLen = promptText.length;
+    entry.stats.lastRespLen = text.length;
+    entry.stats.lastTimeMs = elapsed;
+    entry.stats.lastThinkMs = elapsed;
+    entry.stats.lastGenMs = 0;
+    entry.stats.lastTokens = Math.round(text.length / 4);
+    entry.stats.lastTokensPerSec = 0;
+    if (sessionId === 'cli') updateDashboard();
+    console.log('[bridge] Session ' + sessionId + ' turn ' + entry.turnCount + ' done in ' + elapsed + 'ms, ' + text.length + ' chars');
     return { response: text, truncated: false, elapsed: elapsed, thinkMs: elapsed, genMs: 0 };
   } catch (e) {
-    console.log('[bridge] ERROR:', e.message);
+    console.log('[bridge] Session ' + sessionId + ' ERROR:', e.message);
     return { error: e.message };
   }
 };
 
 window.addEventListener('beforeunload', function() {
-  if (conversationSession) {
-    try { conversationSession.destroy(); } catch (e) {}
-    conversationSession = null;
+  for (const id in sessions) {
+    if (sessions[id].session) {
+      try { sessions[id].session.destroy(); } catch (e) {}
+    }
   }
+  sessions = {};
 });
 </script>
 <script>

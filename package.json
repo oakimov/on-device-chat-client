@@ -4,6 +4,14 @@
   "description": "CLI tool to interact with Chrome's on-device Gemini Nano model via the Prompt API",
   "type": "module",
   "main": "chat.mjs",
+  "files": [
+    "chat.mjs",
+    "lib/",
+    "page.html",
+    "LICENSE",
+    "THIRD_PARTY_LICENSES.txt",
+    "README.md"
+  ],
   "scripts": {
     "start": "node chat.mjs"
   },
