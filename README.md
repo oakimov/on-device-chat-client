@@ -146,9 +146,35 @@ for chunk in response:
         print(chunk.choices[0].delta.content, end="")
 ```
 
-**Example — Claude Code:**
+### Testing the API
 
-Set the API base in your configuration to point at the local server, and Claude Code can route requests to the on-device model.
+A test script `test_api.sh` is provided to verify the API with custom parameters.
+
+**Usage:**
+
+```bash
+./test_api.sh
+```
+
+**Environment Variables:**
+
+- `SYSTEM_MESSAGE` — Instructions for the AI model
+- `USER_MESSAGE` — The actual question or task
+- `TEMPERATURE` — Controls randomness (default: 0.7)
+- `TOP_K` — Top-K sampling parameter (default: 40)
+- `STREAM` — Set to `true` for SSE streaming (default: `false`)
+
+**Example:**
+
+```bash
+SYSTEM_MESSAGE="You are a helpful assistant." TEMPERATURE=0.9 ./test_api.sh
+```
+
+**Integration with Claude Code:**
+
+Claude Code cannot connect to this API directly. To route Claude Code requests to the on-device model, use the [claude-code-router](https://github.com/oakimov/claude-code-router), which provides the required compatibility layer and additional features.
+
+*Note: The Chrome On-Device model logic is currently shared between this project and the router; it will be isolated and unified into a standalone library soon.*
 
 **Request format:**
 
@@ -189,12 +215,12 @@ The tool auto-launches Chrome (or connects to a running instance), then loads a 
 │  CLI / API Clients           │     │  Chrome (Gemini Nano)        │
 │                              │     │                              │
 │  chat.mjs ──┬─ Interactive   │     │  page.html (bridge)          │
-│             ├─ Pipe mode      │     │   ├─ LanguageModel session   │
-│             └─ /v1/* API      │     │   ├─ Streaming + stall det.  │
-│                  │            │     │   └─ Dashboard UI            │
-│                  ▼            │     │           ▲                  │
-│  lib/server.mjs ── HTTP ◄────────────── CDP ──┘                  │
-│  lib/session.mjs ── Puppeteer page.evaluate()                    │
+│             ├─ Pipe mode     │     │   ├─ LanguageModel session   │
+│             └─ /v1/* API     │     │   ├─ Streaming + stall det.  │
+│                  │           │     │   └─ Dashboard UI            │
+│                  ▼           │     │           ▲                  │
+│  lib/server.mjs ── HTTP ◄────────────── CDP ──┘                   │
+│  lib/session.mjs ── Puppeteer page.evaluate()                     │
 └──────────────────────────────┘     └──────────────────────────────┘
 ```
 
@@ -208,18 +234,20 @@ The tool auto-launches Chrome (or connects to a running instance), then loads a 
 
 ---
 
-## Research: Model Obfuscation
+## Research: Model Obfuscation & Deobfuscation
 
-### Why Can't We Convert `weights.bin` to GGUF to use it in llama.cpp or LM Studio?
+To use Gemini Nano with external tools like **LM Studio**, **llama.cpp**, or **Ollama**, the model weights would first need to be converted to a standard format like GGUF or Safetensors. However, Chrome's `weights.bin` is obfuscated, making direct conversion impossible without first reversing the obfuscation scheme. This research section outlines our findings on the obfuscation mechanism and current options for deobfuscation.
 
-The `weights.bin` file is **not** a standard TFLite FlatBuffer. It is obfuscated, making it unreadable by any standard ML tool or converter (TFLite, safetensors, GGUF, MLX, etc.).
+### Why direct conversion fails
+
+The `weights.bin` file is **not** a standard TFLite FlatBuffer. It is obfuscated at the byte level, making it unreadable by standard ML converters (TFLite, safetensors, GGUF, MLX, etc.).
 
 Key evidence:
 
 - **First bytes**: `36730b0edcb1eb52...` — does not match the TFLite FlatBuffer magic
 - **Entropy**: 7.81 bits/byte (first 1KB), 6.61 bits/byte (at ~2GB offset). A standard TFLite model would have much lower entropy due to repeating tensor structures and metadata strings.
 - **No tensor names**: Searching for known Gemini Nano tensor name patterns (e.g., `params.lm.transformer`, `self_attention`, `ff_layer`) returns zero results — the metadata is obfuscated too.
-- **FlatBuffer parsing fails**: `tflite.Model.Model.GetRootAs(buf)` throws `TypeError: bad number` because the root table offset is garbage.
+- **FlatBuffer parsing fails**: `tflite.Model.Model.GetRootAs(buf) ` throws `TypeError: bad number` because the root table offset is garbage.
 
 ### The Obfuscation Library
 
@@ -233,53 +261,30 @@ Located at:
   Versions/<chrome-version>/Libraries/liboptimization_guide_internal.dylib
 ```
 
-This library contains the complete on-device inference stack:
-- **Obfuscation logic** (`obfuscation.cc`)
-- **LiteRT** (formerly TFLite) runtime
-- **XNNPACK** CPU inference backend
-- **Model loading and weight deobfuscation**
+This library contains the complete on-device inference stack, including the obfuscation logic (`obfuscation.cc`), LiteRT runtime, and XNNPACK backend.
 
 ### Obfuscation Implementation Details
 
-From symbol and string analysis of the dylib:
+From symbol and string analysis of the library, the obfuscation implementation is located within Chrome's build at:
+`components/optimization_guide/internal/third_party/odml/src/odml/infra/genai/inference/utils/llm_utils/obfuscation.cc`
 
-**Source path within Chrome's build:**
-```
-components/optimization_guide/internal/third_party/odml/src/odml/infra/genai/inference/utils/llm_utils/obfuscation.cc
-```
-
-**Key error strings reveal the obfuscation scheme:**
+Key error strings reveal the scheme:
 
 | String | What it tells us |
 |--------|-----------------|
-| `"Input is not valid flatbuffer model. Deobfuscation is not supported yet."` | There is a check: if the input is already a valid FlatBuffer, skip deobfuscation. If not, it expects obfuscated input. |
+| `"Input is not valid flatbuffer model. Deobfuscation is not supported yet."` | The loader checks if the input is a valid FlatBuffer; if not, it expects obfuscated input. |
 | `"Unsupported obfuscation version:"` | The obfuscation is versioned — different Chrome releases may use different schemes. |
-| `"odml.infra.proto.ObfuscationParams"` | Obfuscation parameters are stored as a protobuf message, likely embedded in the model file or a sidecar config. |
-| `ModelResourcesTfliteObfuscated` | This is the resource type name — confirming the model is explicitly tagged as "TFLite Obfuscated." |
+| `"odml.infra.proto.ObfuscationParams"` | Parameters are stored as a protobuf message, likely embedded in the model file. |
+| `ModelResourcesTfliteObfuscated` | The model is explicitly tagged as "TFLite Obfuscated." |
 
-**Main C API entry point:**
+### Deobfuscation Options & Comparison
 
-```
-_GetChromeMLAPI
-```
+Currently, there are two paths for obtaining deobfuscated weights:
 
-This is the single exported symbol that Chrome's higher-level code calls to get the ML API function table. From there, model loading flows through the deobfuscation path.
+1. **Older Versions (Legacy)**: Older Chrome versions (before the obfuscation was added) shipped `weights.bin` as a plain TFLite FlatBuffer. These can be parsed directly using tools like [ethanc8/Gemini-Nano](https://github.com/ethanc8/Gemini-Nano). Pre-converted weights are available on HuggingFace at `QuietImpostor/Gemini-Nano-Safetensors`.
+2. **Reverse Engineering (Current)**: The current obfuscation scheme (introduced to prevent extraction) requires reversing the logic in `liboptimization_guide_internal.dylib`. As the error string states: *"Deobfuscation is not supported yet"* — implying it is not intended to be supported outside of Chrome's internal library.
 
-### Obfuscation Scheme (Reconstructed)
-
-Based on the evidence:
-
-1. **Detection**: The loader checks if `weights.bin` is a valid TFLite FlatBuffer. If not, it treats it as obfuscated.
-2. **Parameters**: Obfuscation parameters (likely a key/algorithm identifier) are stored in `ObfuscationParams` protobuf, possibly within `on_device_model_execution_config.pb` or embedded in the file itself.
-3. **Versioning**: The obfuscation has a version field, suggesting the scheme may change across Chrome releases.
-4. **In-memory deobfuscation**: The raw bytes are decoded in memory before being passed to the TFLite interpreter — the deobfuscated model never touches disk.
-5. **High entropy**: The near-maximum entropy (7.81/8.0 bits/byte) suggests encryption or strong byte-level transformation, not just XOR or simple encoding.
-
-### Comparison With Older Versions
-
-Older Chrome versions (before the obfuscation was added) shipped `weights.bin` as a plain TFLite FlatBuffer. The community converter at [ethanc8/Gemini-Nano](https://github.com/ethanc8/Gemini-Nano) could parse these directly and extract weights to safetensors format. Pre-converted weights from those older versions are available on HuggingFace at `QuietImpostor/Gemini-Nano-Safetensors`.
-
-The obfuscation was introduced specifically to prevent this kind of extraction. As the error string states: *"Deobfuscation is not supported yet"* — suggesting it may never be supported outside of Chrome's own internal library.
+Research suggests that deobfuscation happens entirely in-memory: raw bytes are decoded before being passed to the TFLite interpreter, meaning the deobfuscated model never touches the disk.
 
 ### Model Architecture
 
@@ -302,6 +307,7 @@ The converter maps Gemini Nano's internal tensor names to HuggingFace Gemma nami
 ```
 .
 ├── chat.mjs                       # CLI entry point (Chrome lifecycle, interactive mode)
+├── test_api.sh                    # API test script with custom parameters
 ├── page.html                      # Browser bridge (session, streaming, dashboard UI)
 ├── lib/
 │   ├── session.mjs                # SessionManager — Puppeteer page communication, auto-compact
@@ -309,6 +315,7 @@ The converter maps Gemini Nano's internal tensor names to HuggingFace Gemma nami
 ├── find_weights.js                # Utility to locate obfuscated model file
 ├── package.json
 ├── README.md
+├── THIRD_PARTY_LICENSES.txt       # Licenses for external dependencies
 └── node_modules/
 ```
 
@@ -319,3 +326,13 @@ The converter maps Gemini Nano's internal tensor names to HuggingFace Gemma nami
 | `puppeteer-core` | Connect to Chrome via CDP (no bundled browser) |
 | `marked` | Parse Markdown from model output |
 | `marked-terminal` | Render Markdown with ANSI formatting in terminal |
+
+---
+
+## License
+
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+
+### Third-Party Licenses
+
+This project incorporates several third-party libraries. For a full list of these libraries and their respective licenses, please refer to [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt).
