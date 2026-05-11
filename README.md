@@ -194,6 +194,20 @@ The API accepts standard OpenAI Chat Completions request bodies. Supported field
 - **Session persistence**: model sessions persist across requests for conversation continuity within the same client; send a new system prompt to force a session reset
 - **Request validation**: messages array validated with OpenAI-style error responses; 1MB body size limit; 120s request timeout
 
+### Web UI (HuggingFace chat-ui)
+
+A preconfigured chat-ui is available via Docker:
+
+```bash
+docker compose up
+```
+
+Then open http://localhost:3000 in your browser. The UI connects to the local Gemini Nano API automatically.
+
+**Prerequisites:**
+- Docker and Docker Compose installed
+- `node chat.mjs` running (the API server must be active)
+
 ### Dashboard
 
 The tool serves a live dashboard at `http://localhost:3457` (configurable via `--port`). It shows:
@@ -309,6 +323,7 @@ The converter maps Gemini Nano's internal tensor names to HuggingFace Gemma nami
 ```
 .
 ├── chat.mjs                       # CLI entry point (Chrome lifecycle, interactive mode)
+├── docker-compose.yml             # HuggingFace chat-ui preconfigured for local API
 ├── test_api.sh                    # API test script with custom parameters
 ├── page.html                      # Browser bridge (session, streaming, dashboard UI)
 ├── lib/

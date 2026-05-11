@@ -1,0 +1,17 @@
+services:
+  chat-ui:
+    image: ghcr.io/huggingface/chat-ui-db:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - OPENAI_BASE_URL=http://host.docker.internal:3457/v1
+      - OPENAI_API_KEY=unused
+      - MODELS=[{"id":"gemini-nano","name":"Gemini Nano (On-Device)","provider":"openai","providerId":"gemini-nano"}]
+      - ALLOW_IFRAME=true
+    volumes:
+      - chat-ui-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  chat-ui-data:
