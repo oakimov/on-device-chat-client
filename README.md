@@ -2,7 +2,7 @@
 
 ## Overview
 
-Chrome silently downloads a ~4GB Gemini Nano model to this directory for its on-device AI features. This repository contains a CLI tool to interact with the model, an OpenAI-compatible API server, and research findings on the model's format and Chrome's obfuscation mechanism.
+Chrome silently downloads a ~4GB Gemini Nano model to a local directory for its on-device AI features. This repository contains a CLI tool to interact with the model, an OpenAI-compatible API server, and research findings on the model's format and Chrome's obfuscation mechanism.
 
 ## The CLI Tool
 
